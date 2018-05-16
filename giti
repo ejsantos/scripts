@@ -1,0 +1,24 @@
+# git include $hash
+# https://stackoverflow.com/questions/43535132/given-a-commit-id-how-to-determine-if-current-branch-contains-the-commit/43535152#comment74126598_43535132
+# usage: 
+# giti <SHA of commit>
+
+if [ -z ${1+x} ]; then
+  echo "Missing SHA"
+  echo "Usage: giti SHA"
+  exit 1
+fi
+
+if [ -z ${2+x} ]; then
+  branch=HEAD
+else
+  branch=$2
+fi
+
+hash=$1
+
+if git merge-base --is-ancestor $hash $branch; then 
+  echo $branch contain commit $hash
+else 
+  echo $branch does not contain commit $hash
+fi
