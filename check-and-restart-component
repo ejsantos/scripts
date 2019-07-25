@@ -1,0 +1,101 @@
+#!/bin/bash
+set -e
+
+URL='localhost:8080'
+AMBARI_USER='user'
+AMBARI_PASSWORD='password'
+CLUSTER_NAME='ClusterName'
+ROOT_FOLDER=$(dirname "$0")
+
+cd $ROOT_FOLDER
+
+print_help () {
+  echo "check-and-restart-component -c|--component=<VALID COMPONENT>"
+  echo ''
+  echo "List of valid components:"
+  services=($(curl -Ss -u $AMBARI_USER:$AMBARI_PASSWORD -H "X-Requested-By: ambari" -X GET "$URL/api/v1/clusters/$CLUSTER_NAME/services" | jq .items[].ServiceInfo.service_name | tr -d '"'))
+
+  for service in ${services[@]}; do
+    curl -Ss -u $AMBARI_USER:$AMBARI_PASSWORD -H "X-Requested-By: ambari" -X GET "$URL/api/v1/clusters/$CLUSTER_NAME/services/$service/components" | jq .items[].ServiceComponentInfo.component_name | tr -d '"'
+  done
+  exit
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c=*|--component=*)
+      COMPONENT="${1#*=}"
+      shift
+      ;;
+    *)
+      print_help
+      ;;
+  esac
+done
+
+if [ -z $COMPONENT ]; then print_help; fi
+
+## Clear debug.log
+> debug.log
+
+hosts=($(curl -Ss -u $AMBARI_USER:$AMBARI_PASSWORD -H "X-Requested-By: ambari" -X GET "$URL/api/v1/clusters/$CLUSTER_NAME/hosts" | jq .items[].Hosts.host_name | tr -d '"'))
+
+for host in ${hosts[@]}; do
+  host_check=$(curl -Ss -u $AMBARI_USER:$AMBARI_PASSWORD -H "X-Requested-By: ambari" -X GET "$URL/api/v1/clusters/$CLUSTER_NAME/hosts/$host")
+
+  ## DEBUG
+  echo '' >> debug.log
+  echo $host >> debug.log
+  echo $host_check | jq .Hosts.host_state | tr -d '"' >> debug.log
+  echo $host_check | jq .Hosts.host_status | tr -d '"' >> debug.log
+  echo $host_check | jq .Hosts.maintenance_state | tr -d '"' >> debug.log
+
+  if [[ $(echo $host_check | jq .Hosts.host_state | tr -d '"') == 'HEALTHY' ]] && [[ $(echo $host_check | jq .Hosts.host_status | tr -d '"') == 'ALERT' ]] && [[ $(echo $host_check | jq .Hosts.maintenance_state | tr -d '"') == 'OFF' ]]; then
+    response=$(curl -Ss -u $AMBARI_USER:$AMBARI_PASSWORD -H "X-Requested-By: ambari" -X GET "$URL/api/v1/clusters/$CLUSTER_NAME/hosts/$host/host_components/$COMPONENT")
+
+    ## DEBUG
+    echo 'Inside host_check loop' >> debug.log
+
+    if [[ $(echo $response | jq .status) == null ]] && [ $(echo $response | jq .HostRoles.state | tr -d '"') != 'STARTED' ]; then
+      echo "$COMPONENT in $host is $(echo $response | jq .HostRoles.state)"
+
+      ## DEBUG
+      echo 'Inside component check if' >> debug.log
+
+      if [ ! -f $COMPONENT-$host.lock ]; then
+
+        ## DEBUG
+        echo 'Inside lock check if' >> debug.log
+
+        echo "Starting the $COMPONENT in $host"
+        touch $COMPONENT-$host.lock
+        start_resp=$(curl -Ss -u $AMBARI_USER:$AMBARI_PASSWORD -H "X-Requested-By: ambari" -X PUT -d "{\"RequestInfo\": {\"context\" :\"Start $COMPONENT via script\"}, \"Body\": {\"HostRoles\": {\"state\": \"STARTED\"}}}" "$URL/api/v1/clusters/$CLUSTER_NAME/hosts/$host/host_components/$COMPONENT")
+
+        started=''; counter=0
+        while [[ $started != 'STARTED' ]] && [[ $counter -lt 30 ]]; do
+          started=$(curl -Ss -u $AMBARI_USER:$AMBARI_PASSWORD -H "X-Requested-By: ambari" -X GET "$URL/api/v1/clusters/$CLUSTER_NAME/hosts/$host/host_components/$COMPONENT" | jq .HostRoles.state | tr -d '"')
+          counter=$(( $counter + 1))
+          sleep 10
+        done
+
+        if [[ $started == 'STARTED' ]]; then
+          rm -f $COMPONENT-$host.lock
+          echo "$COMPONENT restarted automatically for $host"
+          echo "Please investigate if something else needs to be done"
+          echo ''
+        else
+          echo "$COMPONENT did NOT restart automatically for $host!"
+          echo "Please check ASAP and delete $ROOT_FOLDER/$COMPONENT-$host.lock after resolving."
+          echo ''
+        fi
+
+      else
+        echo "$COMPONENT-$host.lock detected!"
+        echo "This means that the component is being restarted"
+        echo "or someone forget to delete it after resolving the issue"
+        echo ''
+      fi
+    fi
+
+  fi
+done
